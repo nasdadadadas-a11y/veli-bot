@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto,
-    BotCommand, BotCommandScopeChat, MenuButtonCommands, ReplyKeyboardMarkup, KeyboardButton
+    BotCommandScopeChat, MenuButtonDefault, ReplyKeyboardMarkup, KeyboardButton
 )
 from dotenv import load_dotenv
 
@@ -604,8 +604,8 @@ def recipe_kb(user_id, idx, key, flags=0, seed=0):
     name = ALL[idx]["name"]
     rating = db.get_rating(user_id, name)
     rows.append([
-        btn("Понравилось", f"rt:{idx}:{key}:{flags}:{seed}:1", GREEN if rating == 1 else None),
-        btn("Не очень", f"rt:{idx}:{key}:{flags}:{seed}:-1", RED if rating == -1 else None),
+        btn("❤️", f"rt:{idx}:{key}:{flags}:{seed}:1", GREEN if rating == 1 else None),
+        btn("👎", f"rt:{idx}:{key}:{flags}:{seed}:-1", RED if rating == -1 else None),
     ])
     fav_text = "Убрать из избранного" if db.is_fav(user_id, name) else "В избранное"
     row = [btn(fav_text, f"fav:{idx}:{key}:{flags}:{seed}")]
@@ -1093,24 +1093,15 @@ async def start_web():
     await web.TCPSite(runner, "0.0.0.0", int(port)).start()
 
 async def setup_menu_button():
-    """Кнопка «Меню» рядом с полем ввода: всегда под рукой, открывает список команд."""
-    commands = [
-        BotCommand(command="menu", description="Главное меню"),
-        BotCommand(command="fridge", description="Что в холодильнике"),
-        BotCommand(command="favorites", description="Избранное"),
-        BotCommand(command="help", description="Помощь"),
-    ]
+    """Убирает круглую кнопку со списком команд рядом с полем ввода.
+    Остаётся только закреплённая кнопка «Меню» под полем ввода. Команды /menu, /fridge и другие по-прежнему работают."""
     try:
-        await bot.set_my_commands(commands)
-        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-        # разработчику дополнительно показываем /stats
+        await bot.delete_my_commands()
+        await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
         for admin in ADMIN_IDS:
-            await bot.set_my_commands(
-                commands + [BotCommand(command="stats", description="Статистика")],
-                scope=BotCommandScopeChat(chat_id=admin),
-            )
+            await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=admin))
     except Exception as e:
-        print("Не удалось настроить кнопку меню:", e)
+        print("Не удалось убрать круглую кнопку:", e)
 
 async def main():
     global BOT_USERNAME
