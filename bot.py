@@ -3,14 +3,14 @@ from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from html import escape as esc
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto,
-    BotCommand, BotCommandScopeChat, MenuButtonCommands
+    BotCommand, BotCommandScopeChat, MenuButtonCommands, ReplyKeyboardMarkup, KeyboardButton
 )
 from dotenv import load_dotenv
 
@@ -97,7 +97,7 @@ HELP_TEXT = (
     "• Учитывать, есть ли у тебя духовка\n"
     "• Показывать время, цену и КБЖУ на одну порцию\n"
     "• Сохранять любимые рецепты в избранное\n\n"
-    "Главное меню всегда под рукой: кнопка «Меню» рядом с полем ввода или команда /menu"
+    "Главное меню всегда под рукой: кнопка «Меню» внизу или команда /menu"
 )
 
 TZ_TEXT = "Выбери свой часовой пояс, чтобы я подсказывал рецепты по твоему времени."
@@ -267,7 +267,7 @@ OUTROS = {
         "Любимое всегда получается лучше всего.",
     ],
     "shared": [
-        "Приятного аппетита! Хочешь больше рецептов под свой ритм? Открой «Меню» рядом с полем ввода.",
+        "Приятного аппетита! Хочешь больше рецептов под свой ритм? Нажми «Меню» внизу.",
         "Готовь с удовольствием. В главном меню я подберу ещё варианты под твоё время суток.",
     ],
     "fridge": [
@@ -316,8 +316,8 @@ FRIDGE_NONE = (
 )
 
 FALLBACKS = [
-    "Я лучше всего понимаю кнопки. Нажми «Меню» рядом с полем ввода, там всё самое вкусное.",
-    "Хочешь рецепт? Открой «Меню» рядом с полем ввода или отправь /menu.",
+    "Я лучше всего понимаю кнопки. Нажми «Меню» внизу, там всё самое вкусное.",
+    "Хочешь рецепт? Нажми «Меню» внизу или отправь /menu.",
 ]
 
 # ---------- поиск по продуктам ----------
@@ -456,6 +456,43 @@ def btn(text, data, style=None):
         except Exception:
             pass  # если версия aiogram старая, делаем обычную кнопку
     return InlineKeyboardButton(text=text, callback_data=data)
+
+MENU_TEXT = "Меню"
+PIN_TEXT = "Кнопка «Меню» всегда под рукой: она закреплена внизу."
+KB_SHOWN = set()  # кому уже показали закреплённую кнопку (пока бот запущен)
+
+def pinned_kb():
+    """Широкая кнопка «Меню» под полем ввода. Остаётся на любом экране бота."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=MENU_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+async def send_pinned(chat_id, uid):
+    try:
+        await bot.send_message(chat_id, PIN_TEXT, reply_markup=pinned_kb())
+        KB_SHOWN.add(uid)
+        db.set_kb(uid)
+    except Exception as e:
+        print("Не удалось показать закреплённую кнопку:", e)
+
+class PinnedKbMiddleware(BaseMiddleware):
+    """Один раз показывает закреплённую кнопку каждому пользователю, в том числе тем, кто уже пользовался ботом."""
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        is_start = isinstance(event, Message) and (event.text or "").startswith("/start")
+        if user and not is_start and user.id not in KB_SHOWN:
+            if db.kb_shown(user.id):
+                KB_SHOWN.add(user.id)
+            else:
+                msg = event if isinstance(event, Message) else getattr(event, "message", None)
+                if msg is not None:
+                    await send_pinned(msg.chat.id, user.id)
+        return await handler(event, data)
+
+dp.message.outer_middleware(PinnedKbMiddleware())
+dp.callback_query.outer_middleware(PinnedKbMiddleware())
 
 def kb(rows):
     if not rows:
@@ -739,6 +776,7 @@ async def send_home(m: Message):
 async def start(m: Message, command: CommandObject):
     uid = m.from_user.id
     db.log(uid, "start")
+    await send_pinned(m.chat.id, uid)
     arg = command.args or ""
     if arg.startswith("r") and arg[1:] in SLUG_TO_IDX:
         # перешли по ссылке друга: сначала показываем присланный рецепт
@@ -751,6 +789,11 @@ async def start(m: Message, command: CommandObject):
             reply_markup=recipe_kb(uid, idx, "shared", flags, seed),
         )
         return
+    await send_home(m)
+
+@dp.message(F.text == MENU_TEXT)
+async def pinned_menu(m: Message):
+    """Нажатие закреплённой кнопки «Меню» работает на любом экране, даже когда бот ждёт продукты."""
     await send_home(m)
 
 @dp.message(Command("menu"))

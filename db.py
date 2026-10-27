@@ -13,7 +13,7 @@ def init():
             "user_id INTEGER PRIMARY KEY, tz INTEGER)"
         )
         # новые колонки добавляются в уже существующую базу
-        for column in ("oven INTEGER", "created INTEGER"):
+        for column in ("oven INTEGER", "created INTEGER", "kb INTEGER"):
             try:
                 con.execute(f"ALTER TABLE users ADD COLUMN {column}")
             except sqlite3.OperationalError:
@@ -72,6 +72,25 @@ def set_oven(user_id, value):
             "INSERT INTO users (user_id, oven, created) VALUES (?, ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET oven = excluded.oven",
             (user_id, value, int(time.time())),
+        )
+
+
+# ---------- закреплённая кнопка «Меню»: показывали ли её пользователю ----------
+
+def kb_shown(user_id):
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT kb FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return bool(row and row[0])
+
+
+def set_kb(user_id):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO users (user_id, kb, created) VALUES (?, 1, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET kb = 1",
+            (user_id, int(time.time())),
         )
 
 
