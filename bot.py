@@ -9,7 +9,8 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto,
+    BotCommand, BotCommandScopeChat, MenuButtonCommands
 )
 from dotenv import load_dotenv
 
@@ -96,7 +97,7 @@ HELP_TEXT = (
     "• Учитывать, есть ли у тебя духовка\n"
     "• Показывать время, цену и КБЖУ на одну порцию\n"
     "• Сохранять любимые рецепты в избранное\n\n"
-    "Главное меню всегда под рукой: /menu"
+    "Главное меню всегда под рукой: кнопка «Меню» рядом с полем ввода или команда /menu"
 )
 
 TZ_TEXT = "Выбери свой часовой пояс, чтобы я подсказывал рецепты по твоему времени."
@@ -266,8 +267,8 @@ OUTROS = {
         "Любимое всегда получается лучше всего.",
     ],
     "shared": [
-        "Приятного аппетита! Хочешь больше рецептов под свой ритм? Нажми «В меню».",
-        "Готовь с удовольствием. В меню я подберу ещё варианты под твоё время суток.",
+        "Приятного аппетита! Хочешь больше рецептов под свой ритм? Открой «Меню» рядом с полем ввода.",
+        "Готовь с удовольствием. В главном меню я подберу ещё варианты под твоё время суток.",
     ],
     "fridge": [
         "Приятного аппетита! И никакой еды в мусор.",
@@ -315,8 +316,8 @@ FRIDGE_NONE = (
 )
 
 FALLBACKS = [
-    "Я лучше всего понимаю кнопки. Загляни в /menu, там всё самое вкусное.",
-    "Хочешь рецепт? Открой /menu, и я всё подскажу.",
+    "Я лучше всего понимаю кнопки. Нажми «Меню» рядом с полем ввода, там всё самое вкусное.",
+    "Хочешь рецепт? Открой «Меню» рядом с полем ввода или отправь /menu.",
 ]
 
 # ---------- поиск по продуктам ----------
@@ -457,9 +458,10 @@ def btn(text, data, style=None):
     return InlineKeyboardButton(text=text, callback_data=data)
 
 def kb(rows):
+    if not rows:
+        return None  # без кнопок: пустую клавиатуру Telegram не любит
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-MENU_BTN = "В меню"
 
 def tz_kb(back=False):
     rows = []
@@ -494,7 +496,6 @@ def settings_kb():
         [btn("Избранное", "favs")],
         [btn("Изменить часовой пояс", "tzmenu")],
         [btn("Изменить ответ про духовку", "ovenmenu")],
-        [btn(MENU_BTN, "menu")],
     ])
 
 def all_kb():
@@ -502,7 +503,6 @@ def all_kb():
         [btn("Завтрак", "cat:breakfast", GREEN), btn("Обед", "cat:lunch", GREEN)],
         [btn("Ужин", "cat:dinner", GREEN), btn("Перекус", "cat:snack", GREEN)],
         [btn("Случайный рецепт", "cat:random", GREEN)],
-        [btn(MENU_BTN, "menu")],
     ])
 
 # флаги раскрытых разделов рецепта; число порций тоже хранится в флагах (биты 4 и 8)
@@ -576,7 +576,6 @@ def recipe_kb(user_id, idx, key, flags=0, seed=0):
     if link:
         row.append(url_btn("Поделиться", link))
     rows.append(row)
-    rows.append([btn(MENU_BTN, "menu")])
     return kb(rows)
 
 def recipe_button_label(i):
@@ -591,7 +590,6 @@ def favs_kb(names):
 
 def fridge_kb(indices=()):
     rows = [[btn(recipe_button_label(i), f"r:{i}:fridge")] for i in indices]
-    rows.append([btn(MENU_BTN, "menu")])
     return kb(rows)
 
 # ---------- сборка сообщений ----------
@@ -944,6 +942,23 @@ async def fridge_back(c: CallbackQuery):
         await to_text(c, random.choice(FRIDGE_ASK), fridge_kb())
     await c.answer()
 
+@dp.message(Command("fridge"))
+async def fridge_cmd(m: Message):
+    uid = m.from_user.id
+    reset_state(uid)
+    FRIDGE_MODE.add(uid)
+    await m.answer(random.choice(FRIDGE_ASK))
+
+@dp.message(Command("favorites"))
+async def favorites_cmd(m: Message):
+    uid = m.from_user.id
+    reset_state(uid)
+    names = [n for n in db.list_favs(uid) if n in NAME_TO_IDX]
+    if not names:
+        await m.answer(FAV_EMPTY)
+    else:
+        await m.answer(random.choice(FAV_LIST_TEXTS), reply_markup=favs_kb(names))
+
 @dp.message(Command("myid"))
 async def my_id(m: Message):
     """Показывает твой Telegram id: он нужен, чтобы назвать себя разработчиком (ADMIN_ID)."""
@@ -992,7 +1007,7 @@ async def stats_cmd(m: Message):
 async def any_text(m: Message):
     uid = m.from_user.id
     if uid not in FRIDGE_MODE:
-        await m.answer(random.choice(FALLBACKS), reply_markup=kb([[btn(MENU_BTN, "menu")]]))
+        await m.answer(random.choice(FALLBACKS))
         return
     have, unknown = parse_products(m.text)
     unknown_line = ""
@@ -1034,6 +1049,26 @@ async def start_web():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(port)).start()
 
+async def setup_menu_button():
+    """Кнопка «Меню» рядом с полем ввода: всегда под рукой, открывает список команд."""
+    commands = [
+        BotCommand(command="menu", description="Главное меню"),
+        BotCommand(command="fridge", description="Что в холодильнике"),
+        BotCommand(command="favorites", description="Избранное"),
+        BotCommand(command="help", description="Помощь"),
+    ]
+    try:
+        await bot.set_my_commands(commands)
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        # разработчику дополнительно показываем /stats
+        for admin in ADMIN_IDS:
+            await bot.set_my_commands(
+                commands + [BotCommand(command="stats", description="Статистика")],
+                scope=BotCommandScopeChat(chat_id=admin),
+            )
+    except Exception as e:
+        print("Не удалось настроить кнопку меню:", e)
+
 async def main():
     global BOT_USERNAME
     db.init()
@@ -1041,6 +1076,7 @@ async def main():
         BOT_USERNAME = (await bot.get_me()).username
     except Exception:
         BOT_USERNAME = None
+    await setup_menu_button()
     await start_web()
     await dp.start_polling(bot)
 
