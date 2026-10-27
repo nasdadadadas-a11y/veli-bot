@@ -1,4 +1,5 @@
-import asyncio, os, random, re
+import asyncio, os, random, re, zlib
+from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from html import escape as esc
 
@@ -6,7 +7,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto
 )
@@ -21,6 +22,10 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
+
+# Telegram id разработчика (через запятую, если несколько). Задаётся переменной ADMIN_ID.
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_ID", "").replace(" ", "").split(",") if x.isdigit()}
+BOT_USERNAME = None  # узнаём при запуске, нужно для ссылок «Поделиться»
 
 # картинка для приветствия и главного меню (лежит рядом с bot.py)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +53,12 @@ ALL = [r for group in RECIPES.values() for r in group]
 NAME_TO_IDX = {r["name"]: i for i, r in enumerate(ALL)}
 POOLS = {k: [NAME_TO_IDX[r["name"]] for r in v] for k, v in RECIPES.items()}
 POOLS["random"] = list(range(len(ALL)))
+
+def slug(name):
+    """Короткий постоянный код рецепта для ссылок: не меняется, даже если порядок рецептов изменится."""
+    return format(zlib.crc32(name.encode("utf-8")) & 0xFFFFFFFF, "x")
+
+SLUG_TO_IDX = {slug(r["name"]): i for i, r in enumerate(ALL)}
 
 def pool_for(key, uid):
     """Номера рецептов категории. Если духовки нет, рецепты с духовкой не предлагаем."""
@@ -211,6 +222,11 @@ INTROS = {
         "Вот он, твой любимчик:",
         "Рецепт из избранного, готовим?",
     ],
+    "shared": [
+        "Тебе поделились рецептом из Veli:",
+        "Смотри, какой рецепт тебе прислали:",
+        "Рецепт, которым с тобой поделились:",
+    ],
     "fridge": [
         "Отличный выбор из того, что есть дома:",
         "Из твоих продуктов получится вот что:",
@@ -248,6 +264,10 @@ OUTROS = {
         "Приятного аппетита!",
         "Хороший выбор. Готовь с удовольствием.",
         "Любимое всегда получается лучше всего.",
+    ],
+    "shared": [
+        "Приятного аппетита! Хочешь больше рецептов под свой ритм? Нажми «В меню».",
+        "Готовь с удовольствием. В меню я подберу ещё варианты под твоё время суток.",
     ],
     "fridge": [
         "Приятного аппетита! И никакой еды в мусор.",
@@ -485,9 +505,40 @@ def all_kb():
         [btn(MENU_BTN, "menu")],
     ])
 
-# флаги раскрытых разделов рецепта
+# флаги раскрытых разделов рецепта; число порций тоже хранится в флагах (биты 4 и 8)
 SHOW_PRODUCTS = 1
 SHOW_STEPS = 2
+SERVINGS = {}  # сколько порций выбрал пользователь (запоминаем, пока бот запущен)
+
+def servings(flags):
+    return ((flags >> 2) & 3) + 1
+
+def with_servings(flags, n):
+    return (flags & 3) | ((n - 1) << 2)
+
+def start_flags(uid):
+    return with_servings(0, SERVINGS.get(uid, 1))
+
+def need_lines(r, n):
+    """Список продуктов на n порций. Количества целые: на одну порцию уже округлены вверх."""
+    lines = []
+    for name, qty, label in r["items"]:
+        if qty is None:
+            lines.append(f"{name} — по вкусу")
+        else:
+            lines.append(f"{name} — {qty * n} {label}")
+    return lines
+
+def share_url(r):
+    if not BOT_USERNAME:
+        return None
+    link = f"https://t.me/{BOT_USERNAME}?start=r{slug(r['name'])}"
+    text = (f"{cap(r['name'])}: {r['price']} ₽ на порцию, {r['time']} мин, "
+            f"{r['kcal']} ккал. Рецепт из Veli.")
+    return "https://t.me/share/url?url=" + quote(link, safe="") + "&text=" + quote(text, safe="")
+
+def url_btn(text, url):
+    return InlineKeyboardButton(text=text, url=url)
 
 def recipe_kb(user_id, idx, key, flags=0, seed=0):
     hist = HISTORY.get(user_id, [])
@@ -496,19 +547,35 @@ def recipe_kb(user_id, idx, key, flags=0, seed=0):
         rows.append([btn("К избранному", "favs")])
     elif key == "fridge":
         rows.append([btn("К результатам", "fridge_back")])
+    elif key == "shared":
+        pass
     else:
         first_row = []
         if len(hist) >= 2:
             first_row.append(btn("Предыдущий", f"prev:{key}", RED))
         first_row.append(btn("Ещё вариант", f"cat:{key}", GREEN))
         rows.append(first_row)
-    p_text = "Скрыть список продуктов" if flags & SHOW_PRODUCTS else "Список продуктов"
+    n = servings(flags)
+    next_n = n % 4 + 1
+    p_text = "Скрыть продукты" if flags & SHOW_PRODUCTS else "Список продуктов"
     s_text = "Скрыть пошаговый рецепт" if flags & SHOW_STEPS else "Пошаговый рецепт"
-    rows.append([btn(p_text, f"t:{idx}:{key}:{flags ^ SHOW_PRODUCTS}:{seed}")])
+    rows.append([
+        btn(p_text, f"t:{idx}:{key}:{flags ^ SHOW_PRODUCTS}:{seed}"),
+        btn(f"Порции: {n}", f"p:{idx}:{key}:{with_servings(flags, next_n)}:{seed}"),
+    ])
     rows.append([btn(s_text, f"t:{idx}:{key}:{flags ^ SHOW_STEPS}:{seed}")])
-    fav_text = ("Убрать из избранного" if db.is_fav(user_id, ALL[idx]["name"])
-                else "В избранное")
-    rows.append([btn(fav_text, f"fav:{idx}:{key}:{flags}:{seed}")])
+    name = ALL[idx]["name"]
+    rating = db.get_rating(user_id, name)
+    rows.append([
+        btn("Понравилось", f"rt:{idx}:{key}:{flags}:{seed}:1", GREEN if rating == 1 else None),
+        btn("Не очень", f"rt:{idx}:{key}:{flags}:{seed}:-1", RED if rating == -1 else None),
+    ])
+    fav_text = "Убрать из избранного" if db.is_fav(user_id, name) else "В избранное"
+    row = [btn(fav_text, f"fav:{idx}:{key}:{flags}:{seed}")]
+    link = share_url(ALL[idx])
+    if link:
+        row.append(url_btn("Поделиться", link))
+    rows.append(row)
     rows.append([btn(MENU_BTN, "menu")])
     return kb(rows)
 
@@ -553,34 +620,44 @@ def recipe_message(r, key, flags=0, seed=0):
         "",
         f"Время приготовления: {r['time']} мин",
         *([ "Нужна духовка" ] if r.get("oven") else []),
+        *([f"Порций: {servings(flags)}"] if servings(flags) > 1 else []),
         f"Цена на одну порцию: ~{r['price']} ₽",
+        *([f"Цена на все порции: ~{r['price'] * servings(flags)} ₽"] if servings(flags) > 1 else []),
         f"Калорийность на порцию: <b>{r['kcal']} ккал</b>",
         f"Белки {r['p']} г · Жиры {r['f']} г · Углеводы {r['c']} г",
     ]
     if flags & SHOW_PRODUCTS:
-        lines += ["", "<blockquote><b>🛒 Список продуктов</b>\n"
-                  + "\n".join(f"• {esc(cap(x))}" for x in r["need"])
+        n = servings(flags)
+        title = "Список продуктов" if n == 1 else f"Список продуктов на {n} порции"
+        lines += ["", f"<blockquote><b>🛒 {title}</b>\n"
+                  + "\n".join(f"• {esc(cap(x))}" for x in need_lines(r, n))
                   + "</blockquote>"]
     if flags & SHOW_STEPS:
         lines += ["", "<blockquote><b>👩‍🍳 Пошаговый рецепт</b>\n"
                   + "\n".join(f"{i}. {esc(s)}" for i, s in enumerate(r["steps"], 1))
+                  + ("\n<i>Количества в шагах указаны для одной порции, ориентируйся на список продуктов.</i>"
+                     if servings(flags) > 1 else "")
                   + "</blockquote>"]
-    if not flags:
+    if not (flags & 3):
         lines += ["", "<i>Нажми на кнопки ниже, чтобы открыть список продуктов и пошаговый рецепт.</i>"]
     if r.get("tip"):
         lines += ["", f"💡 <i>Совет: {esc(r['tip'])}</i>"]
     lines += ["", outros[(seed // 7) % len(outros)]]
     return "\n".join(lines)
 
-async def show_recipe(c, idx, key, push=True, flags=0, seed=None):
+async def show_recipe(c, idx, key, push=True, flags=None, seed=None):
     """Показывает рецепт номер idx и запоминает его в истории."""
     uid = c.from_user.id
+    if flags is None:
+        flags = start_flags(uid)
     if seed is None:
         seed = random.randint(0, 999)
     hist = HISTORY.setdefault(uid, [])
     if push and (not hist or hist[-1] != idx):
         hist.append(idx)
         del hist[:-30]
+    if push:
+        db.log(uid, "recipe", ALL[idx]["name"])
     await to_text(
         c,
         recipe_message(ALL[idx], key, flags, seed),
@@ -661,7 +738,21 @@ async def send_home(m: Message):
         await send_banner(m, text, markup, part)
 
 @dp.message(CommandStart())
-async def start(m: Message):
+async def start(m: Message, command: CommandObject):
+    uid = m.from_user.id
+    db.log(uid, "start")
+    arg = command.args or ""
+    if arg.startswith("r") and arg[1:] in SLUG_TO_IDX:
+        # перешли по ссылке друга: сначала показываем присланный рецепт
+        idx = SLUG_TO_IDX[arg[1:]]
+        db.log(uid, "shared_open", ALL[idx]["name"])
+        seed = random.randint(0, 999)
+        flags = start_flags(uid)
+        await m.answer(
+            recipe_message(ALL[idx], "shared", flags, seed),
+            reply_markup=recipe_kb(uid, idx, "shared", flags, seed),
+        )
+        return
     await send_home(m)
 
 @dp.message(Command("menu"))
@@ -680,6 +771,7 @@ async def tz_cmd(m: Message):
 async def save_tz(c: CallbackQuery):
     tz = int(c.data.split(":")[1])
     db.set_tz(c.from_user.id, tz)
+    db.log(c.from_user.id, "tz", tz)
     reset_state(c.from_user.id)
     if db.get_oven(c.from_user.id) is None:
         await to_photo(c, f"{TZ_SAVED}\n\n{OVEN_TEXT}", oven_kb())
@@ -741,9 +833,15 @@ async def pick_recipe(c: CallbackQuery):
     key = c.data.split(":")[1]
     hist = HISTORY.get(c.from_user.id, [])
     current = hist[-1] if hist else None
-    pool = pool_for(key, c.from_user.id)
-    options = [i for i in pool if i != current]
-    idx = random.choice(options or pool)
+    uid = c.from_user.id
+    pool = pool_for(key, uid)
+    disliked = db.rated_names(uid, -1)
+    liked = db.rated_names(uid, 1)
+    options = [i for i in pool if i != current and ALL[i]["name"] not in disliked]
+    options = options or [i for i in pool if i != current] or pool
+    weights = [2 if ALL[i]["name"] in liked else 1 for i in options]
+    idx = random.choices(options, weights)[0]
+    db.log(uid, "cat", key)
     await show_recipe(c, idx, key)
     await c.answer()
 
@@ -765,6 +863,35 @@ async def toggle_section(c: CallbackQuery):
     await show_recipe(c, int(idx), key, push=False, flags=int(flags), seed=int(seed))
     await c.answer()
 
+@dp.callback_query(F.data.startswith("p:"))
+async def change_servings(c: CallbackQuery):
+    """Переключает число порций: 1, 2, 3, 4 и снова 1."""
+    _, idx, key, flags, seed = c.data.split(":")
+    flags = int(flags)
+    SERVINGS[c.from_user.id] = servings(flags)
+    db.log(c.from_user.id, "portions", servings(flags))
+    await show_recipe(c, int(idx), key, push=False, flags=flags, seed=int(seed))
+    await c.answer(f"Порций: {servings(flags)}")
+
+@dp.callback_query(F.data.startswith("rt:"))
+async def rate_recipe(c: CallbackQuery):
+    _, idx, key, flags, seed, value = c.data.split(":")
+    idx, value = int(idx), int(value)
+    uid = c.from_user.id
+    name = ALL[idx]["name"]
+    if db.get_rating(uid, name) == value:
+        db.set_rating(uid, name, 0)
+        toast = "Оценка убрана"
+    else:
+        db.set_rating(uid, name, value)
+        db.log(uid, "rate", f"{value}|{name}")
+        toast = ("Спасибо, буду чаще предлагать похожее!" if value == 1
+                 else "Спасибо, такое предлагать реже.")
+    await c.message.edit_reply_markup(
+        reply_markup=recipe_kb(uid, idx, key, int(flags), int(seed))
+    )
+    await c.answer(toast)
+
 @dp.callback_query(F.data.startswith("fav:"))
 async def toggle_fav(c: CallbackQuery):
     _, idx, key, flags, seed = c.data.split(":")
@@ -775,6 +902,7 @@ async def toggle_fav(c: CallbackQuery):
         toast = "Убрано из избранного"
     else:
         db.add_fav(c.from_user.id, name)
+        db.log(c.from_user.id, "fav_add", name)
         toast = "Добавлено в избранное. Хороший выбор!"
     # меняем только кнопки, текст рецепта остаётся прежним
     await c.message.edit_reply_markup(
@@ -816,6 +944,50 @@ async def fridge_back(c: CallbackQuery):
         await to_text(c, random.choice(FRIDGE_ASK), fridge_kb())
     await c.answer()
 
+@dp.message(Command("myid"))
+async def my_id(m: Message):
+    """Показывает твой Telegram id: он нужен, чтобы назвать себя разработчиком (ADMIN_ID)."""
+    await m.answer(f"Твой Telegram ID: <code>{m.from_user.id}</code>")
+
+def stats_text(st):
+    def pct(a, b):
+        return f"{round(100 * a / b)}%" if b else "0%"
+    cats = {"breakfast": "завтрак", "lunch": "обед", "dinner": "ужин", "snack": "перекус", "random": "случайный"}
+    lines = [
+        "<b>Статистика Veli</b>", "",
+        f"Пользователей: {st['users']} (новых: {st['new_day']} за сутки, {st['new_week']} за неделю)",
+        f"Активных: {st['active_day']} за сутки, {st['active_week']} за неделю",
+        f"Рецептов показано: {st['views']} (за неделю: {st['views_week']})",
+        f"Поиск по холодильнику: {st['fridge']}",
+        f"Добавлено в избранное: {st['fav_adds']}",
+        f"Открыто по ссылке «Поделиться»: {st['shared_open']}",
+        f"Оценки: {st['likes']} понравилось, {st['dislikes']} не очень",
+        f"Духовка: есть у {st['oven_yes']}, нет у {st['oven_no']} "
+        f"({pct(st['oven_yes'], st['oven_yes'] + st['oven_no'])} с духовкой)",
+    ]
+    if st["cats"]:
+        lines += ["", "<b>Что выбирают</b>"] + [f"• {cats.get(k, k)}: {v}" for k, v in st["cats"]]
+    if st["top_recipes"]:
+        lines += ["", "<b>Топ рецептов по просмотрам</b>"] + [f"• {esc(cap(n))}: {v}" for n, v in st["top_recipes"]]
+    if st["top_liked"]:
+        lines += ["", "<b>Чаще всего нравятся</b>"] + [f"• {esc(cap(n))}: {v}" for n, v in st["top_liked"]]
+    if st["top_disliked"]:
+        lines += ["", "<b>Чаще всего «не очень»</b>"] + [f"• {esc(cap(n))}: {v}" for n, v in st["top_disliked"]]
+    if st["portions"]:
+        lines += ["", "<b>Порции</b>: " + ", ".join(f"{k}: {v}" for k, v in st["portions"])]
+    if st["tz"]:
+        lines += ["", "<b>Часовые пояса</b>: " + ", ".join(f"UTC+{k}: {v}" for k, v in st["tz"])]
+    if st["unknown"]:
+        lines += ["", "<b>Продукты, которые бот не узнал</b>"] + [f"• {esc(n)}: {v}" for n, v in st["unknown"]]
+    return "\n".join(lines)
+
+@dp.message(Command("stats"))
+async def stats_cmd(m: Message):
+    """Статистика видна только разработчику (его id задан в ADMIN_ID). Остальным команда не отвечает."""
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    await m.answer(stats_text(db.stats()))
+
 @dp.message(F.text)
 async def any_text(m: Message):
     uid = m.from_user.id
@@ -827,6 +999,9 @@ async def any_text(m: Message):
     if unknown:
         shown = ", ".join(esc(u) for u in unknown[:5])
         unknown_line = f"\n\nНе распознал: {shown}. Я знаю не все продукты, но учусь."
+    db.log(uid, "fridge", len(have))
+    for u in unknown[:5]:
+        db.log(uid, "unknown", u.lower()[:40])
     results = find_recipes(have, db.get_oven(uid) != 0)
     if not results:
         await m.answer(FRIDGE_NONE + unknown_line, reply_markup=fridge_kb())
@@ -860,7 +1035,12 @@ async def start_web():
     await web.TCPSite(runner, "0.0.0.0", int(port)).start()
 
 async def main():
+    global BOT_USERNAME
     db.init()
+    try:
+        BOT_USERNAME = (await bot.get_me()).username
+    except Exception:
+        BOT_USERNAME = None
     await start_web()
     await dp.start_polling(bot)
 
