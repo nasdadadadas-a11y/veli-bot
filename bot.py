@@ -49,6 +49,13 @@ NAME_TO_IDX = {r["name"]: i for i, r in enumerate(ALL)}
 POOLS = {k: [NAME_TO_IDX[r["name"]] for r in v] for k, v in RECIPES.items()}
 POOLS["random"] = list(range(len(ALL)))
 
+def pool_for(key, uid):
+    """Номера рецептов категории. Если духовки нет, рецепты с духовкой не предлагаем."""
+    pool = POOLS[key]
+    if db.get_oven(uid) == 0:
+        pool = [i for i in pool if not ALL[i]["oven"]] or pool
+    return pool
+
 # что запоминаем, пока бот запущен
 HISTORY = {}      # пользователь -> номера просмотренных рецептов (для «Предыдущий»)
 FRIDGE_MODE = set()  # кто сейчас вводит продукты для поиска
@@ -66,7 +73,7 @@ ZONES = [
 
 FIRST_TEXT = (
     "Привет, я Veli. Твой помощник в питании.\n"
-    "У меня собрано более 50 простых рецептов для твоего ритма!\n\n"
+    "У меня собрано 100 простых рецептов для твоего ритма!\n\n"
     "Выбери свой часовой пояс, чтобы я понимал, "
     "какие рецепты предложить прямо сейчас."
 )
@@ -75,6 +82,7 @@ HELP_TEXT = (
     "Я Veli, твой помощник в питании. Вот что я умею:\n\n"
     "• Подбирать завтрак, обед или ужин по твоему времени суток\n"
     "• Искать рецепты из продуктов, которые есть дома\n"
+    "• Учитывать, есть ли у тебя духовка\n"
     "• Показывать время, цену и КБЖУ на одну порцию\n"
     "• Сохранять любимые рецепты в избранное\n\n"
     "Главное меню всегда под рукой: /menu"
@@ -83,9 +91,19 @@ HELP_TEXT = (
 TZ_TEXT = "Выбери свой часовой пояс, чтобы я подсказывал рецепты по твоему времени."
 TZ_SAVED = "Готово, часовой пояс сохранён!"
 
+OVEN_TEXT = (
+    "Есть ли у тебя духовка?\n"
+    "От этого зависит, какие рецепты я буду предлагать. "
+    "Без духовки подберу блюда для плиты, сковороды и микроволновки."
+)
+OVEN_SAVED = {
+    1: "Отлично, буду предлагать и блюда из духовки.",
+    0: "Принято, готовим без духовки. Подберу блюда для плиты и сковороды.",
+}
+
 SETTINGS_TEXTS = [
-    "Ты в настройках. Здесь твоё избранное и часовой пояс.",
-    "Настройки. Можно открыть избранное или поменять часовой пояс.",
+    "Ты в настройках. Здесь избранное, часовой пояс и духовка.",
+    "Настройки. Можно открыть избранное, поменять часовой пояс или ответ про духовку.",
 ]
 
 GREETINGS = {
@@ -370,9 +388,11 @@ def parse_products(text):
             unknown.append(p)
     return have, unknown
 
-def find_recipes(have, limit=6):
+def find_recipes(have, oven_ok=True, limit=6):
     found = []
     for i, r in enumerate(ALL):
+        if r["oven"] and not oven_ok:
+            continue
         keys = r["keys"]
         got = [k for k in keys if k in have]
         missing = [k for k in keys if k not in have]
@@ -440,10 +460,20 @@ def home_kb(meal):
         [btn("Настройки", "settings")],
     ])
 
+def oven_kb(back=False):
+    rows = [
+        [btn("Да, есть", "oven:1", GREEN)],
+        [btn("Нет, готовлю без духовки", "oven:0")],
+    ]
+    if back:
+        rows.append([btn("Назад", "settings")])
+    return kb(rows)
+
 def settings_kb():
     return kb([
         [btn("Избранное", "favs")],
         [btn("Изменить часовой пояс", "tzmenu")],
+        [btn("Изменить ответ про духовку", "ovenmenu")],
         [btn(MENU_BTN, "menu")],
     ])
 
@@ -522,6 +552,7 @@ def recipe_message(r, key, flags=0, seed=0):
         f"<i>{esc(r['about'])}</i>",
         "",
         f"Время приготовления: {r['time']} мин",
+        *([ "Нужна духовка" ] if r.get("oven") else []),
         f"Цена на одну порцию: ~{r['price']} ₽",
         f"Калорийность на порцию: <b>{r['kcal']} ккал</b>",
         f"Белки {r['p']} г · Жиры {r['f']} г · Углеводы {r['c']} г",
@@ -622,6 +653,8 @@ async def send_home(m: Message):
     tz = db.get_tz(uid)
     if tz is None:
         await send_banner(m, FIRST_TEXT, tz_kb())
+    elif db.get_oven(uid) is None:
+        await send_banner(m, OVEN_TEXT, oven_kb())
     else:
         reset_state(uid)
         text, markup, part = home_screen(tz)
@@ -648,8 +681,30 @@ async def save_tz(c: CallbackQuery):
     tz = int(c.data.split(":")[1])
     db.set_tz(c.from_user.id, tz)
     reset_state(c.from_user.id)
-    text, markup, part = home_screen(tz)
-    await to_photo(c, f"{TZ_SAVED}\n\n{text}", markup, part)
+    if db.get_oven(c.from_user.id) is None:
+        await to_photo(c, f"{TZ_SAVED}\n\n{OVEN_TEXT}", oven_kb())
+    else:
+        text, markup, part = home_screen(tz)
+        await to_photo(c, f"{TZ_SAVED}\n\n{text}", markup, part)
+    await c.answer()
+
+@dp.callback_query(F.data == "ovenmenu")
+async def oven_menu(c: CallbackQuery):
+    await to_text(c, OVEN_TEXT, oven_kb(back=True))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("oven:"))
+async def save_oven(c: CallbackQuery):
+    uid = c.from_user.id
+    value = int(c.data.split(":")[1])
+    db.set_oven(uid, value)
+    reset_state(uid)
+    tz = db.get_tz(uid)
+    if tz is None:
+        await to_photo(c, FIRST_TEXT, tz_kb())
+    else:
+        text, markup, part = home_screen(tz)
+        await to_photo(c, f"{OVEN_SAVED[value]}\n\n{text}", markup, part)
     await c.answer()
 
 @dp.callback_query(F.data == "tzmenu")
@@ -668,6 +723,8 @@ async def back_to_menu(c: CallbackQuery):
     tz = db.get_tz(uid)
     if tz is None:
         await to_photo(c, FIRST_TEXT, tz_kb())
+    elif db.get_oven(uid) is None:
+        await to_photo(c, OVEN_TEXT, oven_kb())
     else:
         reset_state(uid)
         text, markup, part = home_screen(tz)
@@ -684,8 +741,9 @@ async def pick_recipe(c: CallbackQuery):
     key = c.data.split(":")[1]
     hist = HISTORY.get(c.from_user.id, [])
     current = hist[-1] if hist else None
-    options = [i for i in POOLS[key] if i != current]
-    idx = random.choice(options or POOLS[key])
+    pool = pool_for(key, c.from_user.id)
+    options = [i for i in pool if i != current]
+    idx = random.choice(options or pool)
     await show_recipe(c, idx, key)
     await c.answer()
 
@@ -769,7 +827,7 @@ async def any_text(m: Message):
     if unknown:
         shown = ", ".join(esc(u) for u in unknown[:5])
         unknown_line = f"\n\nНе распознал: {shown}. Я знаю не все продукты, но учусь."
-    results = find_recipes(have)
+    results = find_recipes(have, db.get_oven(uid) != 0)
     if not results:
         await m.answer(FRIDGE_NONE + unknown_line, reply_markup=fridge_kb())
         return

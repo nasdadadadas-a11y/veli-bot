@@ -11,6 +11,11 @@ def init():
             "CREATE TABLE IF NOT EXISTS users ("
             "user_id INTEGER PRIMARY KEY, tz INTEGER)"
         )
+        # колонка про духовку добавляется в уже существующую базу
+        try:
+            con.execute("ALTER TABLE users ADD COLUMN oven INTEGER")
+        except sqlite3.OperationalError:
+            pass
         con.execute(
             "CREATE TABLE IF NOT EXISTS favorites ("
             "user_id INTEGER, recipe TEXT, "
@@ -35,6 +40,25 @@ def set_tz(user_id, tz):
             "INSERT INTO users (user_id, tz) VALUES (?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET tz = excluded.tz",
             (user_id, tz),
+        )
+
+
+# ---------- духовка: 1 есть, 0 нет, None ещё не спрашивали ----------
+
+def get_oven(user_id):
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT oven FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def set_oven(user_id, value):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO users (user_id, oven) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET oven = excluded.oven",
+            (user_id, value),
         )
 
 
