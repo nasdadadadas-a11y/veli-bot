@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto,
-    BotCommandScopeChat, MenuButtonDefault, ReplyKeyboardMarkup, KeyboardButton
+    BotCommandScopeChat, MenuButtonDefault, ReplyKeyboardMarkup, KeyboardButton, LinkPreviewOptions
 )
 from dotenv import load_dotenv
 
@@ -38,7 +38,18 @@ BANNER_FILES = {
     "night": "banner_night.jpg",
     "welcome": "banner.png",
 }
-BANNER_IDS = {}  # после первой отправки запоминаем номер файла в Telegram, чтобы не загружать заново
+BANNER_IDS = {}
+
+# Картинки рецептов лежат в папке images рядом с bot.py и называются номером рецепта: 001.jpg, 002.jpg ...
+# Бот показывает их над текстом рецепта (большое превью ссылки). Telegram забирает картинку с GitHub,
+# поэтому репозиторий должен быть публичным. Адрес папки можно поменять переменной IMAGE_BASE_URL.
+IMAGES_DIR = os.path.join(BASE_DIR, "images")
+IMAGE_BASE_URL = os.getenv(
+    "IMAGE_BASE_URL",
+    "https://raw.githubusercontent.com/nasdadadadas-a11y/veli-bot/main/images/",
+).rstrip("/") + "/"
+IMAGE_VERSION = os.getenv("IMAGE_VERSION", "1")  # поменяй число, если заменил картинки: Telegram запоминает старые
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")  # после первой отправки запоминаем номер файла в Telegram, чтобы не загружать заново
 
 # ---------- данные ----------
 
@@ -54,6 +65,23 @@ ALL = [r for group in RECIPES.values() for r in group]
 NAME_TO_IDX = {r["name"]: i for i, r in enumerate(ALL)}
 POOLS = {k: [NAME_TO_IDX[r["name"]] for r in v] for k, v in RECIPES.items()}
 POOLS["random"] = list(range(len(ALL)))
+
+def rid(idx):
+    """Номер рецепта из трёх цифр: 001 ... 100 (порядок как в файле recipes.py)."""
+    return f"{idx + 1:03d}"
+
+def image_url(idx):
+    for ext in IMAGE_EXTS:
+        if os.path.exists(os.path.join(IMAGES_DIR, rid(idx) + ext)):
+            return f"{IMAGE_BASE_URL}{rid(idx)}{ext}?v={IMAGE_VERSION}"
+    return None
+
+def preview_for(idx):
+    """Картинка рецепта над текстом. Если картинки нет, превью выключено."""
+    url = image_url(idx)
+    if not url:
+        return LinkPreviewOptions(is_disabled=True)
+    return LinkPreviewOptions(url=url, prefer_large_media=True, show_above_text=True)
 
 def slug(name):
     """Короткий постоянный код рецепта для ссылок: не меняется, даже если порядок рецептов изменится."""
@@ -697,6 +725,7 @@ async def show_recipe(c, idx, key, push=True, flags=None, seed=None):
         c,
         recipe_message(ALL[idx], key, flags, seed),
         recipe_kb(uid, idx, key, flags, seed),
+        preview_for(idx),
     )
 
 # ---------- показ экранов (с картинкой и без) ----------
@@ -729,14 +758,14 @@ async def safe_delete(message):
     except TelegramBadRequest:
         pass
 
-async def to_text(c, text, markup):
+async def to_text(c, text, markup, preview=None):
     """Показывает обычный текстовый экран. Если сейчас на экране картинка, заменяет её текстом."""
     if c.message.photo:
         await safe_delete(c.message)
-        await c.message.answer(text, reply_markup=markup)
+        await c.message.answer(text, reply_markup=markup, link_preview_options=preview)
         return
     try:
-        await c.message.edit_text(text, reply_markup=markup)
+        await c.message.edit_text(text, reply_markup=markup, link_preview_options=preview)
     except TelegramBadRequest as e:
         if "not modified" not in str(e):
             raise
@@ -787,6 +816,7 @@ async def start(m: Message, command: CommandObject):
         await m.answer(
             recipe_message(ALL[idx], "shared", flags, seed),
             reply_markup=recipe_kb(uid, idx, "shared", flags, seed),
+            link_preview_options=preview_for(idx),
         )
         return
     await send_home(m)
@@ -1111,6 +1141,11 @@ async def main():
     except Exception:
         BOT_USERNAME = None
     await setup_menu_button()
+    have = sum(1 for i in range(len(ALL)) if image_url(i))
+    print(f"Картинки рецептов: найдено {have} из {len(ALL)}")
+    if have < len(ALL):
+        missing = [rid(i) for i in range(len(ALL)) if not image_url(i)]
+        print("Нет картинок для номеров:", ", ".join(missing[:30]), "..." if len(missing) > 30 else "")
     await start_web()
     await dp.start_polling(bot)
 
